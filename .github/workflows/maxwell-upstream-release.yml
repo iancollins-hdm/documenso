@@ -159,8 +159,9 @@ jobs:
       - name: Check the subjects reached the compiled English catalog
         if: steps.todo.outputs.run == 'true'
         run: |
-          catalog=packages/lib/translations/en/web.js
-          for text in 'Signing Complete: \"' 'Waiting for others to complete signing: \"'; do
+          # lingui compile writes web.mjs; production loads it in i18n-server.tsx.
+          catalog=packages/lib/translations/en/web.mjs
+          for text in 'Signing Complete: ' 'Waiting for others to complete signing: '; do
             if ! grep -qF "$text" "$catalog"; then
               echo "Not in $catalog: $text (the email would show a message id instead of words)" | tee -a "$GITHUB_STEP_SUMMARY"
               exit 1
