@@ -83,6 +83,7 @@ jobs:
       - name: Is there anything to do?
         id: todo
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           BRANCH: ${{ steps.release.outputs.branch }}
         run: |
@@ -93,7 +94,12 @@ jobs:
             echo "$DEPLOY_BRANCH already contains $TAG. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
-            echo "Branch $BRANCH already exists (its pull request is waiting for a decision). Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq length)
+            if [ "$open" = "0" ]; then
+              echo "Branch $BRANCH exists but has no open pull request (an earlier run stopped half way, or the pull request was closed). Delete the branch or open its pull request by hand." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "The pull request for $BRANCH is open and waiting for a decision. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
