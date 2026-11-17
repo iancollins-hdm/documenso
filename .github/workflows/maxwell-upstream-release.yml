@@ -1,0 +1,203 @@
+# Maxwell Power: keep this fork on Documenso's releases.
+#
+# Production Documenso (https://esign.maxwellpower.com, Railway project "Sign",
+# service documenso-web) is built from the `maxwell` branch of this fork.
+# `maxwell` is a Documenso release plus one small patch: the document's name in
+# the "Signing Complete" and "Waiting for others to complete signing" email
+# subjects (packages/lib/jobs/definitions/emails/).
+#
+# Every Monday this job finds Documenso's newest release. If `maxwell` does not
+# contain it yet, it merges the release into a branch, checks the patch is still
+# there, builds the app the way Documenso's own CI does, and opens a pull request
+# against `maxwell`. MERGING THAT PULL REQUEST SHIPS IT TO PRODUCTION.
+#
+# Releases only, never upstream `main`.
+#
+# The push uses a deploy key of this repository alone (secret MAXWELL_DEPLOY_KEY,
+# write access): a release usually changes upstream's workflow files, and the
+# built-in token is not allowed to push those. Upstream's own workflows are
+# switched off in this fork, and this job switches off any new one it finds, so
+# only this file runs here.
+
+name: 'Maxwell: merge the latest Documenso release'
+
+on:
+  schedule:
+    - cron: '17 15 * * 1' # Mondays, 15:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: maxwell-upstream-release
+  cancel-in-progress: false
+
+env:
+  DEPLOY_BRANCH: maxwell
+  UPSTREAM: documenso/documenso
+  THIS_WORKFLOW: .github/workflows/maxwell-upstream-release.yml
+
+jobs:
+  merge-release:
+    name: Merge the latest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Switch off upstream workflows in this fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | select(.path | startswith(".github/workflows/")) | "\(.id) \(.path)"' |
+          while read -r id path; do
+            if [ "$path" != "$THIS_WORKFLOW" ]; then
+              echo "Switching off $path"
+              gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+            fi
+          done
+
+      - name: Find the newest Documenso release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "Unexpected release tag: '$tag'"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=upstream-release/$tag" >> "$GITHUB_OUTPUT"
+          echo "Newest Documenso release: $tag"
+
+      - name: Checkout ${{ env.DEPLOY_BRANCH }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_BRANCH }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.MAXWELL_DEPLOY_KEY }}
+
+      - name: Is there anything to do?
+        id: todo
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream "refs/tags/$TAG:refs/tags/$TAG"
+
+          if git merge-base --is-ancestor "refs/tags/$TAG" HEAD; then
+            echo "$DEPLOY_BRANCH already contains $TAG. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            echo "Branch $BRANCH already exists (its pull request is waiting for a decision). Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge the release
+        if: steps.todo.outputs.run == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$BRANCH"
+
+          if ! git merge --no-ff -m "chore: merge Documenso $TAG into $DEPLOY_BRANCH" "refs/tags/$TAG"; then
+            {
+              echo "## $TAG does not merge cleanly into $DEPLOY_BRANCH"
+              echo
+              echo "Merge it by hand. Conflicted files:"
+              echo
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Check the Maxwell patch is still there
+        if: steps.todo.outputs.run == 'true'
+        run: |
+          dir=packages/lib/jobs/definitions/emails
+          completed=$(grep -cF 'Signing Complete: "${envelope.title}"' "$dir/send-document-completed-emails.handler.ts" || true)
+          pending=$(grep -cF 'Waiting for others to complete signing: "${envelope.title}"' "$dir/send-document-pending-email.handler.ts" || true)
+          unpatched=$(grep -rlF --include='*.ts' --include='*.tsx' 'msg`Signing Complete!`' packages apps || true)
+
+          if [ "$completed" != "2" ] || [ "$pending" != "1" ] || [ -n "$unpatched" ]; then
+            {
+              echo "## The email-subject patch did not survive the merge"
+              echo
+              echo "Expected the document title in 2 completion subjects and 1 pending subject;"
+              echo "found $completed and $pending."
+              if [ -n "$unpatched" ]; then echo "Still sending the bare \"Signing Complete!\": $unpatched"; fi
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Patch present: 2 completion subjects, 1 pending subject."
+
+      - name: Install dependencies
+        if: steps.todo.outputs.run == 'true'
+        uses: ./.github/actions/node-install
+
+      - name: Build (as Documenso's CI does)
+        if: steps.todo.outputs.run == 'true'
+        run: |
+          cp .env.example .env
+          npm run build
+
+      - name: Check the subjects reached the compiled English catalog
+        if: steps.todo.outputs.run == 'true'
+        run: |
+          catalog=packages/lib/translations/en/web.js
+          for text in 'Signing Complete: \"' 'Waiting for others to complete signing: \"'; do
+            if ! grep -qF "$text" "$catalog"; then
+              echo "Not in $catalog: $text (the email would show a message id instead of words)" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          echo "Both subjects are in the compiled English catalog."
+
+      - name: Push the branch
+        if: steps.todo.outputs.run == 'true'
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: git push origin "$BRANCH"
+
+      - name: Open the pull request
+        if: steps.todo.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          base=$(git merge-base "origin/$DEPLOY_BRANCH" "refs/tags/$TAG")
+          count=$(git rev-list --count "origin/$DEPLOY_BRANCH..refs/tags/$TAG")
+
+          cat > pr-body.md <<EOF
+          Documenso [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) merged into \`$DEPLOY_BRANCH\`: $count upstream commits since \`${base:0:8}\`.
+
+          > [!WARNING]
+          > **Merging this pull request is a production deploy.** Railway builds the production
+          > signing service (documenso-web, https://esign.maxwellpower.com) from \`$DEPLOY_BRANCH\`.
+
+          This job checked:
+          - the release merged without conflicts;
+          - the Maxwell patch is still in place (document name in the "Signing Complete" and
+            "Waiting for others to complete signing" subjects);
+          - \`npm run build\` succeeds and both subjects are in the compiled English catalog.
+
+          It did NOT check that the app starts. Documenso v2.21.1 built fine on Railway and then
+          failed at start-up (one deploy logged "empty host in database URL"). Before merging:
+          - read the release notes for new or renamed environment variables and migrations;
+          - note the running deployment id in Railway, so it can be redeployed if this one fails;
+          - after the deploy, sign one test agreement and check the emails.
+          EOF
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$DEPLOY_BRANCH" --head "$BRANCH" \
+            --title "chore: merge Documenso $TAG into $DEPLOY_BRANCH" --body-file pr-body.md |
+            tee -a "$GITHUB_STEP_SUMMARY"
