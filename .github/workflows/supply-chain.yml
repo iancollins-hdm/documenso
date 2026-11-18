@@ -1,0 +1,55 @@
+name: supply-chain
+
+# Blocks known-malicious packages and lockfile drift before they reach a deploy.
+# Standard library Python only (.github/scripts/supply-chain-check.py): no
+# third-party action and no package install, so the check adds no supply chain of
+# its own and costs about one Actions minute.
+#
+# Runs when dependencies or workflows change, plus by hand. The daily re-check of
+# what is already locked (a package can be flagged malicious after we pinned it)
+# runs centrally in the threat watch, not here, to keep Actions minutes down.
+# Not a required check yet: nothing else is named `supply-chain`.
+
+on:
+  pull_request:
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/pnpm-lock.yaml"
+      - "**/yarn.lock"
+      - "**/bun.lock"
+      - "**/deno.lock"
+      - "**/requirements*.txt"
+      - "**/pyproject.toml"
+      - "**/Dockerfile*"
+      - ".github/workflows/**"
+      - ".github/scripts/supply-chain-check.py"
+  push:
+    branches: [maxwell]
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/pnpm-lock.yaml"
+      - "**/yarn.lock"
+      - "**/bun.lock"
+      - "**/deno.lock"
+      - "**/requirements*.txt"
+      - "**/pyproject.toml"
+      - "**/Dockerfile*"
+      - ".github/workflows/**"
+      - ".github/scripts/supply-chain-check.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: lockfiles + known-malicious packages
+        run: python3 -I .github/scripts/supply-chain-check.py
